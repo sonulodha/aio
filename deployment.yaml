@@ -1,0 +1,179 @@
+{{- if eq .Values.type "deployment" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "eCapService.fullname" . }}
+  labels:
+    {{- include "eCapService.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  {{- /* If not otherwise specified, keep two instances running in prod - redundancy */}}
+  replicas: {{ .Values.replicaCount | default (eq $.Values.env "prod" | ternary  2 1) }}
+  {{- end }}
+  revisionHistoryLimit: 0
+  selector:
+    matchLabels:
+      {{- include "eCapService.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "eCapService.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ .Release.Name }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Release.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- /* image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}" */}}
+          {{- /* eCapital uses its image update process to update the kustomization in the manifests repo. The image must be the service name. */}}
+          image: {{ .Release.Name }}
+          {{- /* Once it's pulled once, the layers are cached. "Always" means "check for a newer version". */}}
+          imagePullPolicy: {{ .Values.image.pullPolicy | default "Always" }}
+          envFrom:
+            - secretRef:
+                {{- /* We create this, one to a namespace. */}}
+                name: {{ $.Release.Name }}-env
+          {{- if or .Values.environment .Values.tracing.enabled }}
+          env:
+            {{- /* This is defaulted to an empty map. */}}
+            {{- range $k, $v := .Values.environment }}
+            - name: {{ $k }}
+              value: !!str {{ $v }}
+            {{- end }}
+            {{- with $.Values.tracing }}
+            {{- if .enabled }}
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: OTLP_GRPC_PORT
+              value: !!str {{ .otlp_port }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .otlp_endpoint }}
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: !!str {{ .otlp_protocol }}
+            {{- end }}
+            {{- end }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          {{- with .Values.service.livenessProbe }}
+          livenessProbe:
+            httpGet:
+              path: {{ .path }}
+              port: {{ .port }}
+          {{- end }}
+          {{- with .Values.service.readinessProbe }}
+          readinessProbe:
+            httpGet:
+              path: {{ .path }}
+              port: {{ .port }}
+            initialDelaySeconds: {{ .initialDelaySeconds }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            {{- /* We create this. */}}
+            - mountPath: /app/appsettings.json
+              name: secret-settings
+              readOnly: true
+              subPath: appsettings.json # required
+            # env required as a volumeMount to sync data from AWS
+            - mountPath: /app/envsettings.json
+              name: env-settings
+              readOnly: true
+              # This isn't mounted within the pod.
+              #subPath: appsettings.json
+            {{- with .Values.tmpDirs }}
+            {{- range . }}
+            - name: {{ .name | quote }}
+              mountPath: {{ printf "/app/tmp/%s" .name | quote }}
+              readOnly: false
+            {{- end }}
+            {{- end }}
+            {{- with .Values.additionalSecrets }}
+            {{- range .}}
+            - name: {{ .secretName | quote }}
+              mountPath: {{ .mountPath | quote }}
+              readOnly: true
+            {{- end }}
+            {{- end }}
+      nodeSelector:
+        {{- if not (and $.Values.nodeSelector (hasKey $.Values.nodeSelector "workload")) }}
+        workload: service
+        {{- end }}
+        # Micro-services should run in the "service" nodegroup
+        {{- with $.Values.nodeSelector }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      tolerations:
+        {{- if not (and $.Values.nodeSelector (hasKey $.Values.nodeSelector "workload")) }}
+        - key: "workload"
+          operator: "Equal"
+          value: "service"
+          effect: "NoExecute"
+        {{- end }}
+        {{- with .Values.tolerations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      volumes:
+        {{- /* When Infisical is enabled, mount from K8s Secrets managed by Infisical. */}}
+        {{- if .Values.secrets.infisical.enabled }}
+        - name: secret-settings
+          secret:
+            secretName: {{ default (printf "%s-appsettings" $.Release.Name) .Values.secrets.infisical.appsettings.managedSecretName }}
+        - name: env-settings
+          secret:
+            secretName: {{ default (printf "%s-env" $.Release.Name) .Values.secrets.infisical.env.managedSecretName }}
+        {{- else }}
+          # Update the overlay with the names of these secrets
+          # env-settings: key-value pair environment file
+          # secret-settings: a file to be mounted at /app/appsettings.json
+        - name: secret-settings
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              # Kustomize sets the namespace, and that's what differentiates the secrets by environment.
+              secretProviderClass: {{ $.Release.Name }}-appsettings
+          # Do not remove:
+          # https://secrets-store-csi-driver.sigs.k8s.io/topics/sync-as-kubernetes-secret
+          # "The volume mount is required for the Sync With Kubernetes Secrets"
+        - name: env-settings
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ $.Release.Name }}-env
+        {{- end }}
+      {{- with .Values.tmpDirs }}
+      {{- range . }}
+        - name: {{ .name | quote }}
+          emptyDir: {}
+      {{- end }}
+      {{- end }}
+      {{- with .Values.additionalSecrets }}
+      {{- range .}}
+        - name: {{ .secretName | quote }}
+          secret:
+            secretName: {{ .secretName | quote }}
+            optional: true
+      {{- end }}
+      {{- end }}
+{{- end }}

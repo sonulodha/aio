@@ -1,0 +1,179 @@
+{{- if eq .Values.type "job" }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "eCapService.fullname" . }}
+  labels:
+    {{- include "eCapService.labels" . | nindent 4 }}
+spec:
+  template:
+    metadata:
+      {{- with $.Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "eCapService.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ .Release.Name }}
+      {{- with $.Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: {{ include "eCapService.fullname" . }}
+        {{- /* image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}" */}}
+        image: {{ $.Release.Name }}
+        {{- with $.Values.securityContext }}
+        securityContext:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        imagePullPolicy: {{ $.Values.image.pullPolicy | default "always" }}
+        env:
+        {{- /* This is defaulted to an empty map. */}}
+        {{- range $k, $v := .Values.environment }}
+        - name: {{ $k }}
+          value: !!str {{ $v }}
+        {{- end }}
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: SERVICE_NAME
+          value: {{ include "eCapService.fullname" . }}
+        - name: SERVICE_VERSION
+          value: {{ .Values.image.tag | quote }}
+        {{- with $.Values.tracing }}
+        {{- if .enabled }}
+        - name: HOST_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: OTLP_GRPC_PORT
+          value: !!str {{ .otlp_port }}
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: {{ .otlp_endpoint }}
+        - name: OTEL_EXPORTER_OTLP_PROTOCOL
+          value: !!str {{ .otlp_protocol }}
+        {{- end }}
+        {{- end }}
+        envFrom:
+        - secretRef:
+            name: shared-env
+        - secretRef:
+            name: {{ include "eCapService.fullname" . }}-env
+            optional: true
+        # Resources are by default set according to best practices:
+        # - No CPU limits to avoid unnecessary starvation
+        # - Set memory limits and requests equal to each other
+        #   to guarantee 0 pod evictions
+        # - Memory limits may need to be loosened on new workloads as we
+        #   learn how much memory it uses
+        resources:
+          limits:
+            {{- with .Values.resources.limits.cpu }}
+            cpu: {{ . | quote }}
+            {{- end }}
+            memory: {{ .Values.resources.limits.memory | default "256Mi" | quote }}
+          requests:
+            cpu: {{ .Values.resources.requests.cpu | default "50m" | quote }}
+            memory: {{ .Values.resources.requests.memory | default "256Mi" | quote }}
+        volumeMounts:
+        - mountPath: /app/appsettings.json
+          name: secret-settings
+          readOnly: true
+          subPath: appsettings.json # required
+        # env required as a volumeMount to sync data from AWS
+        - mountPath: /app/envsettings.json
+          name: env-settings
+          readOnly: true
+          # This isn't mounted within the pod.
+          #subPath: appsettings.json
+        {{- with .Values.tmpDirs }}
+        {{- range . }}
+        - name: {{ .name | quote }}
+          mountPath: {{ printf "/app/tmp/%s" .name | quote }}
+          readOnly: false
+        {{- end }}
+        {{- end }}
+        {{- with .Values.additionalSecrets }}
+        {{- range .}}
+        - name: {{ .secretName | quote }}
+          mountPath: {{ .mountPath | quote }}
+          readOnly: true
+        {{- end }}
+        {{- end }}
+      restartPolicy: Never
+      nodeSelector:
+        {{- if not (and $.Values.nodeSelector (hasKey $.Values.nodeSelector "workload")) }}
+        # Micro-services should run in the "service" nodegroup; "job"s as batch.
+        workload: batch
+        {{- end }}
+        {{- with $.Values.nodeSelector }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      tolerations:
+        {{- if not (and $.Values.nodeSelector (hasKey $.Values.nodeSelector "workload")) }}
+        # Micro-services should run in the "service" nodegroup; "job"s as batch.
+        - key: "workload"
+          operator: "Equal"
+          value: "batch"
+          effect: "NoExecute"
+        {{- end }}
+        {{- with $.Values.tolerations }}
+        {{- toYaml . | nindent 12 }}
+        {{- end }}
+      volumes:
+        {{- /* When Infisical is enabled, mount from K8s Secrets managed by Infisical. */}}
+        {{- if .Values.secrets.infisical.enabled }}
+        - name: secret-settings
+          secret:
+            secretName: {{ printf "%s-appsettings" $.Release.Name }}
+        - name: env-settings
+          secret:
+            secretName: {{ printf "%s-env" $.Release.Name }}
+        {{- else }}
+          # Update the overlay with the names of these secrets
+          # env-settings: key-value pair environment file
+          # secret-settings: a file to be mounted at /app/appsettings.json
+        - name: secret-settings
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              # Kustomize sets the namespace, and that's what differentiates the secrets by environment.
+              secretProviderClass: {{ $.Release.Name }}-appsettings
+          # Do not remove:
+          # https://secrets-store-csi-driver.sigs.k8s.io/topics/sync-as-kubernetes-secret
+          # "The volume mount is required for the Sync With Kubernetes Secrets"
+        - name: env-settings
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ $.Release.Name }}-env
+        {{- end }}
+      {{- with .Values.tmpDirs }}
+      {{- range . }}
+        - name: {{ .name | quote }}
+          emptyDir: {}
+      {{- end }}
+      {{- end }}
+      {{- with .Values.additionalSecrets }}
+      {{- range .}}
+        - name: {{ .secretName | quote }}
+          secret:
+            secretName: {{ .secretName | quote }}
+            optional: true
+      {{- end }}
+      {{- end }}
+  backoffLimit: 0
+{{- end }}
