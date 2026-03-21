@@ -1,0 +1,196 @@
+{{- if eq .Values.type "cronjob" }}
+{{- /* has to be set, because "range" replaces .Values, and `include' doesn't work with $ */}}
+{{- $fullname := include "eCapService.fullname" . }}
+{{- $labels := include "eCapService.labels" . }}
+{{- range $idx, $crn := .Values.cronjob }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $fullname }}-{{ $idx }}
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  concurrencyPolicy: {{ $crn.concurrencyPolicy | default "Allow" | quote }}
+  schedule: {{ $crn.schedule | quote }}
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          {{- with $.Values.podAnnotations }}
+          annotations:
+            {{- . | nindent 12 }}
+          {{- end }}
+          labels:
+            {{- $labels | nindent 12 }}
+        spec:
+          serviceAccountName: {{ $.Release.Name }}
+          {{- with $.Values.podSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+          - name: {{ $fullname }}
+            {{- /* We don't allow overriding the image; it needs to be set to the app name so that the override in */}}
+            {{- /* kustomization.yaml will happen. */}}
+            {{- /* image: "img:{{ $.Values.image.repository }}:{{ $.Values.image.tag | default $.Chart.AppVersion }}" */}}
+            image: {{ $.Release.Name }}
+            args: {{ $crn.args }}
+            {{- with $.Values.securityContext }}
+            securityContext:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+            imagePullPolicy: {{ $.Values.image.pullPolicy }}
+            env:
+            {{- /* This is defaulted to an empty map. */}}
+            {{- range $k, $v := $.Values.environment }}
+            - name: {{ $k }}
+              value: !!str {{ $v }}
+            {{- end }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SERVICE_NAME
+              value: {{ $fullname }}
+            - name: SERVICE_VERSION
+              value: {{ $.Values.image.tag | quote }}
+            {{- with $.Values.tracing }}
+            {{- if .enabled }}
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: OTLP_GRPC_PORT
+              value: !!str {{ .otlp_port }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .otlp_endpoint }}
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: !!str {{ .otlp_protocol }}
+            {{- end }}
+            {{- end }}
+            envFrom:
+            - secretRef:
+                {{- /* We create this, one to a namespace. */}}
+                name: {{ $.Release.Name }}-env
+                optional: true
+            # Resources are by default set according to best practices:
+            # - No CPU limits to avoid unnecessary starvation
+            # - Set memory limits and requests equal to each other
+            #   to guarantee 0 pod evictions
+            # - Memory limits may need to be loosened on new workloads as we
+            #   learn how much memory it uses
+            {{- /* TODO: Per-cronjob task resources. */}}
+            resources:
+              limits:
+                {{- with $.Values.resources.limits.cpu }}
+                # You should very probably never limit a process. Find its bug and fix it. If you
+                # limit the process' CPU, you're not giving more to any other process -- the nodes
+                # are memory-bound, not CPU-bound -- you're simply introducing artificial latency.
+                cpu: {{ . | quote }}
+                {{- end }}
+                memory: {{ $.Values.resources.limits.memory | default "32Mi" | quote }}
+              requests:
+                {{- with $.Values.resources.requests.cpu }}{{/* So often these services end up idle. */}}
+                cpu: {{ . | quote }}
+                {{- end }}
+                memory: {{ $.Values.resources.requests.memory | default "32Mi" | quote }}
+            volumeMounts:
+            - mountPath: /app/appsettings.json
+              name: secret-settings
+              readOnly: true
+              subPath: appsettings.json # required
+            # env required as a volumeMount to sync data from AWS
+            - mountPath: /app/envsettings.json
+              name: env-settings
+              readOnly: true
+              # This isn't mounted within the pod.
+              #subPath: appsettings.json
+            {{- with $.Values.tmpDirs }}
+            {{- range . }}
+            - name: {{ .name | quote }}
+              mountPath: {{ printf "/app/tmp/%s" .name | quote }}
+              readOnly: false
+            {{- end }}
+            {{- end }}{{- /* with tmpDirs */}}
+            {{- with $.Values.additionalSecrets }}
+            {{- range .}}
+            - name: {{ .secretName | quote }}
+              mountPath: {{ .mountPath | quote }}
+              readOnly: true
+            {{- end }}
+            {{- end }}{{- /* with additionalSecrets */}}
+          restartPolicy: Never
+          nodeSelector:
+            {{- if not (and $.Values.nodeSelector (hasKey $.Values.nodeSelector "workload")) }}
+            workload: batch
+            {{- end }}
+            {{- with $.Values.nodeSelector }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with $.Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          tolerations:
+            {{- if not (and $.Values.nodeSelector (hasKey $.Values.nodeSelector "workload")) }}
+            # Micro-services should run in the "service" nodegroup; "job"s as batch
+            - key: "workload"
+              operator: "Equal"
+              value: "batch"
+              effect: "NoExecute"
+            {{- end }}
+            {{- with $.Values.tolerations }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumes:
+          {{- /* When Infisical is enabled, mount from K8s Secrets managed by Infisical. */}}
+          {{- if $.Values.secrets.infisical.enabled }}
+          - name: secret-settings
+            secret:
+              secretName: {{ include "eCapService.infisicalManagedSecretNameAppsettings" $ }}
+          - name: env-settings
+            secret:
+              secretName: {{ include "eCapService.infisicalManagedSecretNameEnv" $ }}
+          {{- else }}
+            # Update the overlay with the names of these secrets
+            # env-settings: key-value pair environment file
+            # secret-settings: a file to be mounted at /app/appsettings.json
+          - name: secret-settings
+            csi:
+              driver: secrets-store.csi.k8s.io
+              readOnly: true
+              volumeAttributes:
+                # Kustomize sets the namespace, and that's what differentiates the secrets by environment.
+                secretProviderClass: {{ $.Release.Name }}-appsettings
+            # Do not remove:
+            # https://secrets-store-csi-driver.sigs.k8s.io/topics/sync-as-kubernetes-secret
+            # "The volume mount is required for the Sync With Kubernetes Secrets"
+          - name: env-settings
+            csi:
+              driver: secrets-store.csi.k8s.io
+              readOnly: true
+              volumeAttributes:
+                secretProviderClass: {{ $.Release.Name }}-env
+          {{- end }}
+          {{- with $.Values.tmpDirs }}
+          {{- range . }}
+          - name: {{ .name | quote }}
+            emptyDir: {}
+          {{- end }}
+          {{- end }}{{- /* with tmpDirs */}}
+          {{- with $.Values.additionalSecrets }}
+          {{- range .}}
+          - name: {{ .secretName | quote }}
+            secret:
+              secretName: {{ .secretName | quote }}
+              optional: true
+          {{- end }}
+          {{- end }}{{- /* with additionalSecrets */}}
+      backoffLimit: 0
+{{- end }}{{/* range */}}
+{{- end }}{{/* if cronjob */}}

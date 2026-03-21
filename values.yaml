@@ -1,0 +1,200 @@
+# Default values for eCapService.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# In order to override the service's fullname from the repository name
+#fullname: "STRING"
+
+# Defines whether this project should be templated as a deployment,
+# job, or knative service.
+#
+# VALUES: [ deployment | cronjob ]
+# pending: job | kservice
+#
+type: deployment
+
+# Per-environment, you may override the number of replicas of this [deployment].
+# By default, this is unspecified, and you get 1 replica in non-prod environments,
+# and two replicas in the prod environment.
+#replicaCount: 1
+
+# Environment valiables. Key-value pairs.
+environment: {}
+  # ENV: production
+  # TESTING: false
+  # NEWRELIC_API_KEY: xyzabc
+
+image:
+  repository: nginx
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+
+  # IamRoleArn: You can specify this here, or you can create your own annotation.
+  # If the iam role is present in annotations, it'll override this - even if it's an empty string.
+  # NOTE! If you specify "iam:::" then the account ID will be substituted automatically based on                          # the environment.
+  # Valid substitutions are: appName, namespace, env
+  IamRoleArn: arn:aws:iam:::role/eks/${appName}-${env}
+  # If you need a namespace suffix for the IAM role, supply it here.
+  # This will append exactly this text to the end of IamRoleArn, above.
+  # NOTE! Does not affect the annotations!!
+  IamRoleArnSuffix: ""  # arn:aws:iam:::role/eks/${appName}-${env}<IamRoleArnSuffix>
+
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext: {}
+  # fsGroup: 2000
+
+securityContext: {}
+  # capabilities:
+  #   drop:
+  #   - ALL
+  # readOnlyRootFilesystem: true
+  # runAsNonRoot: true
+  # runAsUser: 1000
+
+service:
+  type: ClusterIP
+  port: 8081
+  #readinessProbe:
+  #  path: /
+  #  port: http
+  #livenessProbe:
+  #  path: /
+  #  port: http
+  #  initialDelaySeconds: 30
+
+ingress:
+  enabled: false
+  className: ""
+  # acmCertArn: AWS Certificate Manager arn for this account/environment
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # kubernetes.io/tls-acme: "true"
+  hosts: []
+    #- host: chart-example.local
+    #  paths:
+    #    - path: /
+    #      pathType: ImplementationSpecific
+  # WARNING: tls: [] does not work with AWS ALBs. Specify acmCertArn.
+  tls: []
+  #  - secretName: chart-example-tls
+  #    hosts:
+  #      - chart-example.local
+
+resources:
+  limits:
+  #   cpu: 100m -- NEVER EVER EVER LIMIT CPU
+     memory: 24Mi   # You MUST tune your service!!
+  requests:
+     cpu: 1m        # You MUST tune your service!!
+     memory: 24Mi   # You MUST tune your service!
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 100
+  targetCPUUtilizationPercentage: 80
+  # targetMemoryUtilizationPercentage: 80
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+tracing: 
+  # It's expensive; use it sparingly?
+  enabled: false
+
+  # env var: OTEL_EXPORTER_OTLP_ENDPOINT
+  otlp_endpoint: "http://$(HOST_IP):$(OTLP_GRPC_PORT)"
+  otlp_port: "4317" # env var: OTLP_GRPC_PORT
+  otlp_protocol: grpc   # env var: OTEL_EXPORTER_OTLP_PROTOCOL
+
+
+# Secrets configuration. By default, services use AWS Secrets Manager via CSI.
+# Infisical can be enabled per-service/per-environment.
+#
+# When Infisical is enabled:
+#   - InfisicalSecret CR names: <service>-appsettings, <service>-env
+#   - Managed K8s Secret names: <service>-appsettings, <service>-env
+#   - secretNamespace: from eCapService.namespace (e.g. <service>-<env> like wallet-graphql-dev)
+#   - Volume names in deployment: secret-settings, env-settings
+secrets:
+  awsCsi:
+    # Keep existing behaviour by default.
+    enabled: true
+
+  infisical:
+    # Opt-in. When true, InfisicalSecret CRs are created and volumes
+    # use managed K8s Secrets instead of CSI.
+    enabled: false
+
+    # Optional overrides (leave "" or omit to use chart defaults).
+    identityId: ""          # default: env-based (see eCapService.infisicalIdentityId in _helpers.tpl)
+    projectSlug: ""         # default: Helm release name (.Release.Name)
+    envSlug: ""             # default: .Values.env
+    serviceAccountName: "infisical-operator"
+    serviceAccountNamespace: "infisical-operator"
+
+    appsettings:
+      secretsPath: "/"             # e.g. "/wallet-graphql/appsettings"
+      creationPolicy: "Owner"
+      recursive: false             # Override via values when needed
+      # TODO: wire in templates for override (default: <service>-appsettings)
+      secretName: appsettings.json
+      # K8s Secret the operator creates/syncs (must match volume + managedSecretReference).
+      managedSecretName: ""         # default: <release>-appsettings
+      managedSecretNamespace: ""    # default: eCapService.namespace
+
+    env:
+      secretsPath: "/"             # e.g. "/wallet-graphql/env"
+      creationPolicy: "Owner"
+      recursive: false             # Override via values when needed
+      # TODO: wire in templates for override (default: <service>-env)
+      secretName: env.json
+      managedSecretName: ""         # default: <release>-env
+      managedSecretNamespace: ""    # default: eCapService.namespace
+
+# Applied to every resource
+standard-labels:
+  app.kubernetes.io/managed-by: nonprod-gitops
+
+# Provides configuration specific to a cronjob
+cronjob:
+  - # Provides the schedule for the cronjob.
+    #
+    # VALUES: "[STR]"
+    #
+    # RECOMMENDED: "0 */12 * * *"
+    schedule: "0 */12 * * *"
+
+    # Specifies whether multiple cronjob runs can run concurrently.
+    #
+    # VALUES: "[STR]"
+    #
+    # RECOMMENDED: "0 */12 * * *"
+    concurrencyPolicy: "Allow"
+
+    # Specify container arguments -- the entrypoint / main command is run, args are passed
+    # after this command. If you have more than one cronjob action for this image, this is
+    # the way to differentiate the actions / schedules.
+    #
+    # VALUES: ["STR" ...]
+    args: []
+    
